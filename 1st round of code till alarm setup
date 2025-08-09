@@ -1,0 +1,140 @@
+#include <Wire.h>
+#include <Adafruit_SH110X.h>  // SH1106 OLED library
+#include <RTClib.h>           // For DS3231M
+
+// Create OLED display object (128x64 pixels, I2C)
+Adafruit_SH1106G display = Adafruit_SH1106G(128, 64, &Wire);
+
+// Create RTC object
+RTC_DS3231 rtc;
+
+// Buzzer pin
+#define BUZZER_PIN  27   // Buzzer GPIO
+
+// Button pins
+#define BTN_HOUR   32    // Button to set hours
+#define BTN_MIN    33    // Button to set minutes
+
+// Alarm time (default)
+int alarmHour = 19;
+int alarmMinute = 58;
+
+bool alarmTriggered = false;
+
+// Debounce variables
+unsigned long lastHourPress = 0;
+unsigned long lastMinPress = 0;
+const unsigned long debounceDelay = 250; // ms
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();  // SDA=21, SCL=22 by default on ESP32
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(BTN_HOUR, INPUT_PULLUP);
+  pinMode(BTN_MIN, INPUT_PULLUP);
+
+  // Initialize OLED
+  if (!display.begin(0x3C, true)) {
+    Serial.println("SH1106 OLED not found");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+
+  // Initialize RTC
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find DS3231M RTC");
+    while (1);
+  }
+
+  Serial.println("Setup complete");
+}
+
+void loop() {
+  DateTime now = rtc.now();  // Get IST time from RTC
+
+  // Handle button presses
+  handleButtons();
+
+  // Format time as HH:MM:SS
+  char timeStr[9];
+  sprintf(timeStr, "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
+
+  // Format date as DD/MM/YYYY
+  char dateStr[11];
+  sprintf(dateStr, "%02d/%02d/%04d", now.day(), now.month(), now.year());
+
+  // Format alarm time as HH:MM
+  char alarmStr[6];
+  sprintf(alarmStr, "%02d:%02d", alarmHour, alarmMinute);
+
+  // Display on OLED
+  display.clearDisplay();
+
+  // Current time
+  display.setTextSize(1);
+  display.setCursor(28, 0);
+  display.print("IST Time");
+
+  display.setTextSize(2);
+  display.setCursor(14, 14);
+  display.print(timeStr);
+
+  // Date
+  display.setTextSize(1);
+  display.setCursor(30, 40);
+  display.print(dateStr);
+
+  // Alarm time
+  display.setTextSize(1);
+  display.setCursor(0, 54);
+  display.print("Alarm: ");
+  display.print(alarmStr);
+
+  display.display();
+
+  // Check alarm trigger
+  if (now.hour() == alarmHour && now.minute() == alarmMinute && !alarmTriggered) {
+    alarmTriggered = true;
+    beepBuzzer(10, 300); // 10 beeps, 300ms each
+  }
+
+  // Reset alarm trigger for next day/minute
+  if (now.hour() != alarmHour || now.minute() != alarmMinute) {
+    alarmTriggered = false;
+  }
+
+  delay(200);
+}
+
+void handleButtons() {
+  // Hour button
+  if (digitalRead(BTN_HOUR) == LOW && millis() - lastHourPress > debounceDelay) {
+    lastHourPress = millis();
+    alarmHour++;
+    if (alarmHour >= 24) alarmHour = 0; // wrap around
+    Serial.print("Alarm Hour set to: ");
+    Serial.println(alarmHour);
+  }
+
+  // Minute button
+  if (digitalRead(BTN_MIN) == LOW && millis() - lastMinPress > debounceDelay) {
+    lastMinPress = millis();
+    alarmMinute++;
+    if (alarmMinute >= 60) alarmMinute = 0; // wrap around
+    Serial.print("Alarm Minute set to: ");
+    Serial.println(alarmMinute);
+  }
+}
+
+void beepBuzzer(int times, int duration) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(duration);
+    digitalWrite(BUZZER_PIN, LOW);
+    delay(duration);
+  }
+}
