@@ -1,0 +1,283 @@
+// ===== LIBRARIES =====
+#include <Wire.h>
+#include <RTClib.h>
+#include "HX711.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+
+// ===== PIN DEFINITIONS =====
+#define BUZZER_RELAY_PIN    13
+#define MOTOR_RELAY_PIN     12
+#define BUTTON_HOUR         25
+#define BUTTON_MINUTE       26
+// seconds button removed
+#define BUTTON_ALARM_SET    14
+#define BUTTON_ALARM_RESET  33
+
+#define LOADCELL_DOUT_PIN   4
+#define LOADCELL_SCK_PIN    5
+
+// ===== OLED SETTINGS =====
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ===== RTC & LOAD CELL =====
+RTC_DS3231 rtc;
+HX711 scale;
+
+// ===== GLOBAL VARIABLES =====
+// alarm stored as 12-hour + AM/PM
+int alarmHour12 = 9;        // 1..12
+int alarmMinute = 35;       // 0..59
+bool alarmIsPM = true;      // true = PM, false = AM
+
+bool alarmActive = false;
+unsigned long alarmStartTime = 0;
+
+// durations (ms)
+const unsigned long DURATION_OVER_THRESHOLD = 70000UL;    // 70 seconds
+const unsigned long DURATION_UNDER_THRESHOLD = 7000000UL; // 7000 seconds
+
+const float WEIGHT_THRESHOLD = 10.0f; // kg
+
+float calibration_factor = -7050.0f; // Set after calibration for your hardware
+
+// ===== BUTTON STATE TRACKING =====
+bool lastHourState = HIGH;
+bool lastMinuteState = HIGH;
+bool lastAlarmResetState = HIGH;
+bool lastAlarmSetState = HIGH;
+unsigned long alarmSetPressStart = 0;
+
+// ===== FUNCTION DECLARATIONS =====
+void displayData(float weight, DateTime now);
+void startAlarm();
+void stopAlarm();
+void checkButtons();
+bool isButtonPressed(int pin, bool &lastState);
+int convert12To24(int h12, bool isPM);
+void setAlarmFrom24(int h24, int m);
+void doTare();
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin();
+
+  // ===== OLED INIT =====
+  if (!display.begin(0x3C, true)) {
+    Serial.println(F("SH1106 allocation failed"));
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+  // ===== RTC INIT =====
+  if (!rtc.begin()) {
+    Serial.println("Couldn't find RTC");
+    while (1);
+  }
+  if (rtc.lostPower()) {
+    Serial.println("RTC lost power, setting time!");
+    // set to IST example time - change as needed
+    rtc.adjust(DateTime(2025, 8, 10, 17, 17, 0));
+  }
+
+  // ===== HX711 INIT =====
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale();    // clear any previous scale
+  doTare();             // tare with current load so current load = 0
+  scale.set_scale(calibration_factor); // set calibration factor
+
+  // ===== PIN MODES =====
+  pinMode(BUZZER_RELAY_PIN, OUTPUT);
+  pinMode(MOTOR_RELAY_PIN, OUTPUT);
+  pinMode(BUTTON_HOUR, INPUT_PULLUP);
+  pinMode(BUTTON_MINUTE, INPUT_PULLUP);
+  pinMode(BUTTON_ALARM_SET, INPUT_PULLUP);
+  pinMode(BUTTON_ALARM_RESET, INPUT_PULLUP);
+
+  stopAlarm(); // ensure off
+  delay(500);
+}
+
+void loop() {
+  DateTime now = rtc.now();
+  float weight = scale.get_units(5); // average 5 readings
+
+  // remove tiny drift and negative near-zero
+  if (fabs(weight) < 0.02f) weight = 0.0f;
+  if (weight < 0) weight = 0.0f;
+
+  // ===== CHECK ALARM TRIGGER (hour & minute only) =====
+  int alarm24 = convert12To24(alarmHour12, alarmIsPM);
+  if (!alarmActive &&
+      now.hour() == alarm24 &&
+      now.minute() == alarmMinute) {
+    startAlarm();
+  }
+
+  // ===== ALARM AUTO STOP LOGIC =====
+  if (alarmActive) {
+    if (weight > WEIGHT_THRESHOLD) {
+      // Weight above threshold -> stop after 70 seconds
+      if ((millis() - alarmStartTime) >= DURATION_OVER_THRESHOLD) {
+        stopAlarm();
+      }
+    } else {
+      // Weight <= threshold -> stop after 7000 seconds
+      if ((millis() - alarmStartTime) >= DURATION_UNDER_THRESHOLD) {
+        stopAlarm();
+      }
+    }
+  }
+
+  // ===== CHECK BUTTON INPUTS =====
+  checkButtons();
+
+  // ===== DISPLAY DATA =====
+  displayData(weight, now);
+
+  delay(200);
+}
+
+// ===== FUNCTIONS =====
+void displayData(float weight, DateTime now) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+
+  // show date & 12-hour time with seconds
+  int displayHour = now.hour() % 12;
+  if (displayHour == 0) displayHour = 12;
+  char line1[40];
+  snprintf(line1, sizeof(line1), "%02d/%02d/%04d %02d:%02d:%02d %s",
+           now.day(), now.month(), now.year(),
+           displayHour, now.minute(), now.second(),
+           (now.hour() >= 12) ? "PM" : "AM");
+  display.println(line1);
+
+  // Weight (big)
+  display.setTextSize(2);
+  display.setCursor(0, 16);
+  char wbuf[24];
+  snprintf(wbuf, sizeof(wbuf), "%.2f kg", weight);
+  display.println(wbuf);
+
+  // Alarm info & status (show 12-hour alarm)
+  display.setTextSize(1);
+  display.setCursor(0, 48);
+  char abuf[48];
+  snprintf(abuf, sizeof(abuf), "Alarm: %02d:%02d %s   %s",
+           alarmHour12, alarmMinute, alarmIsPM ? "PM" : "AM",
+           alarmActive ? "ALARM ACTIVE!" : "Alarm Idle");
+  display.println(abuf);
+
+  display.display();
+}
+
+void startAlarm() {
+  digitalWrite(BUZZER_RELAY_PIN, HIGH);
+  digitalWrite(MOTOR_RELAY_PIN, HIGH);
+  alarmActive = true;
+  alarmStartTime = millis();
+  Serial.println("Alarm Started");
+}
+
+void stopAlarm() {
+  digitalWrite(BUZZER_RELAY_PIN, LOW);
+  digitalWrite(MOTOR_RELAY_PIN, LOW);
+  alarmActive = false;
+  Serial.println("Alarm Stopped");
+}
+
+void checkButtons() {
+  // Hour increment button (1..12)
+  if (isButtonPressed(BUTTON_HOUR, lastHourState)) {
+    alarmHour12 = (alarmHour12 % 12) + 1; // cycles 1..12
+    Serial.print("Alarm hour (12h) set to: "); Serial.println(alarmHour12);
+  }
+
+  // Minute increment button (wraps 0-59)
+  if (isButtonPressed(BUTTON_MINUTE, lastMinuteState)) {
+    alarmMinute = (alarmMinute + 1) % 60;
+    Serial.print("Alarm minute set to: "); Serial.println(alarmMinute);
+  }
+
+  // Alarm set button: short press -> set alarm to next minute (preserves AM/PM)
+  // Long press (>= 800 ms) -> toggle AM/PM
+  bool cur = digitalRead(BUTTON_ALARM_SET);
+  if (lastAlarmSetState == HIGH && cur == LOW) {
+    // pressed
+    alarmSetPressStart = millis();
+    lastAlarmSetState = LOW;
+  } else if (lastAlarmSetState == LOW && cur == HIGH) {
+    // released
+    unsigned long dur = millis() - alarmSetPressStart;
+    lastAlarmSetState = HIGH;
+    if (dur >= 800UL) {
+      // long press -> toggle AM/PM
+      alarmIsPM = !alarmIsPM;
+      Serial.print("Alarm AM/PM toggled: "); Serial.println(alarmIsPM ? "PM" : "AM");
+    } else {
+      // short press -> set to next minute (use current RTC time)
+      DateTime now = rtc.now();
+      int nh = now.hour();
+      int nm = (now.minute() + 1) % 60;
+      if (nm == 0) nh = (nh + 1) % 24;
+      setAlarmFrom24(nh, nm);
+      Serial.print("Alarm set to next minute: ");
+      Serial.print(alarmHour12); Serial.print(":"); Serial.print(alarmMinute);
+      Serial.print(" "); Serial.println(alarmIsPM ? "PM" : "AM");
+    }
+  }
+  // else: no change (still holding or idle)
+
+  // Alarm reset button: stop the alarm if running (instant)
+  if (isButtonPressed(BUTTON_ALARM_RESET, lastAlarmResetState)) {
+    stopAlarm();
+    Serial.println("Alarm Reset (manual)");
+  }
+}
+
+bool isButtonPressed(int pin, bool &lastState) {
+  bool currentState = digitalRead(pin);
+  if (lastState == HIGH && currentState == LOW) {
+    delay(50); // debounce
+    if (digitalRead(pin) == LOW) {
+      lastState = LOW;
+      return true;
+    }
+  }
+  if (currentState == HIGH) lastState = HIGH;
+  return false;
+}
+
+int convert12To24(int h12, bool isPM) {
+  // h12 in 1..12
+  if (h12 == 12) return isPM ? 12 : 0;
+  return isPM ? (h12 + 12) : h12;
+}
+
+void setAlarmFrom24(int h24, int m) {
+  // convert 24-hour h24 to alarmHour12 & alarmIsPM
+  alarmMinute = m % 60;
+  if (h24 == 0) { alarmHour12 = 12; alarmIsPM = false; }
+  else if (h24 == 12) { alarmHour12 = 12; alarmIsPM = true; }
+  else if (h24 > 12) { alarmHour12 = h24 - 12; alarmIsPM = true; }
+  else { alarmHour12 = h24; alarmIsPM = false; }
+}
+
+void doTare() {
+  // Tare a few times to stabilize baseline
+  for (int i = 0; i < 5; ++i) {
+    scale.tare();
+    delay(150);
+  }
+  Serial.println("Scale tared at startup.");
+}
